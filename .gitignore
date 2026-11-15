@@ -1,0 +1,13 @@
+# Ce dossier contient aussi d'autres projets : on ne suit QUE le bot pilote MSFS.
+*
+!.gitignore
+!README.md
+!requirements.txt
+!pilote_auto.py
+!essai_atterrissage.py
+!lancer_bot.bat
+!demarrage_auto.bat
+
+# Jamais publies, meme si on les ajoute par erreur ci-dessus :
+# telegram.json (jeton du bot), reglages.json, journal_vol*.txt, decollage_*.csv,
+# atterrissage_*.csv, aeroports.csv et pistes.csv (telecharges tout seuls).
