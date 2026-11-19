@@ -480,6 +480,10 @@ AIDE = ("UN VOL, DANS L'ORDRE\n"
         "Taux de montee : regle tout seul sur la vitesse de l'avion\n"
         "Vitesse de cabre au decollage : celle de l'avion charge\n"
         "Vol trop court pour monter puis descendre : je me mets en palier\n"
+        "Avion de ligne (multimoteur qui decroche au-dessus de 90 kt) : automanette, 250 kt sous "
+        "10000 ft, Mach 0,78 au plus, volets rentres cran par cran, aerofreins en descente, altimetre "
+        "standard au-dessus de 18000 ft, atterrissage par l'autoland de l'avion sur ILS (sinon je te "
+        "rends l'avion a 3 NM)\n"
         "Aussi : altimetre recale, phares selon l'altitude, alertes carburant et relief\n"
         "\n"
         "POUR CHOISIR TOI-MEME (au premier vol, donne au moins la croisiere)\n"
@@ -559,9 +563,12 @@ def fiche_avion(sim):
     vr = vitesse("DESIGN SPEED MIN ROTATION") or vitesse("DESIGN TAKEOFF SPEED")
     if vs1 and (vr is None or vr < 1.1 * vs1):
         vr = 1.2 * vs1                  # vitesse de cabre absente ou trop basse : 20 % au-dessus du decrochage
-    return {"vs0": vitesse("DESIGN SPEED VS0"), "vs1": vs1, "vr": round(vr) if vr else None,
-            "montee": vitesse("DESIGN SPEED CLIMB"),
-            "moteurs": min(max(int(num(sim.lire("NUMBER_OF_ENGINES"), 1)), 1), 4),
+    vs0 = vitesse("DESIGN SPEED VS0")
+    moteurs = min(max(int(num(sim.lire("NUMBER_OF_ENGINES"), 1)), 1), 4)
+    return {"vs0": vs0, "vs1": vs1, "vr": round(vr) if vr else None,
+            "montee": vitesse("DESIGN SPEED CLIMB"), "moteurs": moteurs,
+            # Avion de ligne (ou d'affaires) : multimoteur qui decroche au-dessus de 90 kt.
+            "ligne": moteurs >= 2 and (vs0 or vs1 or 0) >= 90,
             "ap": booleen(sim.lire("AUTOPILOT_AVAILABLE")), "categorie": texte_sim(sim.lire("CATEGORY"))}
 
 
@@ -1159,6 +1166,40 @@ def tenir_vitesse(sim, etat, ias):
     sim.envoyer("THROTTLE_SET", etat["gaz"] * 16383)
 
 
+def vitesse_ligne(sim, a, avion, phase, alt, ias, vitesse, etat):
+    """Avion de ligne, toutes les 10 s : vitesse visee selon la phase (250 kt sous 10000 ft, puis
+    vitesse de montee de l'avion ou 280 kt en descente, jamais plus de Mach 0,78), tenue par
+    l'automanette de l'avion, sinon par le bot (dictionnaire 'vitesse'). En descente trop
+    rapide : aerofreins, rentres une fois la vitesse revenue. Renvoie la vitesse visee."""
+    cible = 250 if alt < 10000 else 280 if phase == "DESCENTE" else avion["montee"] or 290
+    mach = num(sim.lire("AIRSPEED_MACH"))
+    if mach > 0.4:                                   # en altitude, c'est le Mach qui limite
+        cible = min(cible, ias * 0.78 / mach)
+    cible = round(cible)
+    if "at" not in etat:                             # premiere fois : automanette ?
+        if a.gaz and booleen(sim.lire("AUTOPILOT_THROTTLE_ARM")) is False:
+            sim.envoyer("AUTO_THROTTLE_ARM")
+        etat["at"] = booleen(frais(sim, "AUTOPILOT_THROTTLE_ARM")) is True
+        dire("Vitesse tenue par l'automanette de l'avion." if etat["at"] else
+             "Pas d'automanette : je tiens la vitesse aux gaz." if a.gaz else
+             "Pas d'automanette et gaz interdits : surveille la vitesse.", tel=True)
+    if etat["at"]:
+        sim.envoyer("AP_SPD_VAR_SET", cible)
+        if booleen(sim.lire("AUTOPILOT_AIRSPEED_HOLD")) is False:
+            sim.envoyer("AP_AIRSPEED_ON")
+    elif vitesse is not None:
+        vitesse["cible"] = cible
+    if phase == "DESCENTE" and ias > cible + 15 and not etat.get("af"):
+        sim.envoyer("SPOILERS_ON")
+        etat["af"] = True
+        dire(f"{ias:.0f} kt pour {cible} voulus : je sors les aerofreins.", tel=True)
+    elif etat.get("af") and (ias < cible + 3 or phase != "DESCENTE"):
+        sim.envoyer("SPOILERS_OFF")
+        etat["af"] = False
+        dire("Aerofreins rentres.")
+    return cible
+
+
 # --------------------------------------------------------------------------
 # Preparation de l'avion et decollage automatique
 # --------------------------------------------------------------------------
@@ -1345,6 +1386,47 @@ def Volets():
          lambda sim: sim.envoyer("FLAPS_SET", 0),
          lambda sim: sim.variable("FLAPS HANDLE INDEX", "Number", 0),
          cran_par_cran])
+
+
+class VoletsParCran:
+    """Avion de ligne : volets rentres un cran a la fois, le premier a 'v_premier' kt puis 20 kt
+    de plus par cran (tout rentrer d'un coup a basse vitesse le ferait decrocher). Meme usage
+    que Rentree : a appeler environ une fois par seconde, avion en l'air."""
+
+    def __init__(self, v_premier):
+        self.v, self.fini, self.rentre = v_premier, False, None
+        self.envoye, self.attente, self.echecs = None, 0, 0
+
+    def pas(self, sim):
+        if self.fini:
+            return
+        cran = num(sim.lire_vite("FLAPS_HANDLE_INDEX"), None)
+        if cran is None or self.attente > 0:
+            self.attente = max(self.attente - 1, 0)
+            return
+        if self.envoye is not None:                 # le cran demande la fois d'avant est-il parti ?
+            if cran < self.envoye:
+                self.v, self.echecs = self.v + 20, 0
+            else:
+                self.echecs += 1
+            self.envoye = None
+        if cran < 0.5:
+            self.fini = self.rentre = True
+            if self.v > 0 and self.echecs == 0:
+                dire("Volets rentres, cran par cran.", tel=True)
+            return
+        if self.echecs >= 3:
+            self.fini, self.rentre = True, False
+            dire("Volets : cet avion n'obeit pas a ma commande, rentre-les a la main.", alerte=True)
+            return
+        if num(sim.lire("AIRSPEED_INDICATED")) >= self.v:
+            sim.envoyer("FLAPS_DECR")
+            self.envoye, self.attente = cran, 3
+
+
+def volets_pour(avion, vr):
+    """Facon de rentrer les volets apres le decollage : d'un coup, ou cran par cran sur un avion de ligne."""
+    return VoletsParCran(vr + 30) if avion["ligne"] else Volets()
 
 
 def sens_commande(sim, reglage, bouton, variable):
@@ -1629,12 +1711,15 @@ def preparer_approche(sim, a, avion):
     vapp = vitesse_approche(avion)
     if not vapp:
         return None, "je ne connais pas la vitesse de decrochage de cet avion"
-    pose = arrondi_possible(a)
+    # Avion de ligne : pas d'arrondi fait par le bot (trop d'inertie), c'est l'autoland de l'avion sur l'ILS.
+    pose = arrondi_possible(a) and not avion["ligne"]
     dire(f"Approche : piste {piste['ident']} de {a.code_arrivee} (axe {piste['cap']:.0f} vrai, "
          f"{piste['longueur_m']:.0f} m, vent du {vent_de:.0f} a {vent_kt:.0f} kt), vitesse d'approche {vapp} kt. "
-         + ("Je me poserai et je m'arreterai sur la piste." if pose
-            else "Je te rendrai l'avion a 3 NM de la piste, stabilise, pour l'atterrissage."), tel=True)
-    return nouvelle_approche(piste, vapp, pose), None
+         + ("Je me poserai et je m'arreterai sur la piste." if pose else
+            "L'autoland de l'avion se posera si l'ILS de la piste est capte ; sinon je te rendrai l'avion "
+            "a 3 NM." if avion["ligne"] else
+            "Je te rendrai l'avion a 3 NM de la piste, stabilise, pour l'atterrissage."), tel=True)
+    return nouvelle_approche(piste, vapp, pose, autoland=avion["ligne"]), None
 
 
 def vitesse_approche(avion):
@@ -1648,8 +1733,9 @@ def arrondi_possible(a):
     return bool(a.gaz) and all(a.sens.get(k) for k in ("pal", "prof", "aile"))
 
 
-def nouvelle_approche(piste, vapp, pose):
-    return {"piste": piste, "vapp": vapp, "pose": pose, "etabli": False, "plan": False, "stable": False,
+def nouvelle_approche(piste, vapp, pose, autoland=False):
+    return {"piste": piste, "vapp": vapp, "pose": pose, "autoland": autoland,
+            "etabli": False, "plan": False, "stable": False,
             "hist": [], "wca": 0.0, "decl": 0.0, "bug": None, "vs_cmd": None, "t_volets": 0,
             "train": TrainSorti(), "ils": "non" if piste.get("fictive") else None, "ils_t": 0.0,
             "cap_prec": None, "raison": ""}
@@ -1659,6 +1745,8 @@ def preparer_repetition(sim, a, avion):
     """Piste imaginaire 2000 ft sous l'avion, 8 NM devant lui dans l'axe de son cap : le bot y
     fait toute l'approche et l'arrondi en plein ciel, pour regler l'arrondi sans risquer l'avion.
     Renvoie (etat de l'approche, None) ou (None, raison)."""
+    if avion["ligne"]:
+        return None, "un avion de ligne se pose avec son autoland sur l'ILS, il n'y a pas d'arrondi a repeter"
     if not arrondi_possible(a):
         return None, ("je ne connais pas le sens des gouvernes de cet avion (envoie 'vol' une fois avec "
                       "l'avion a l'arret au sol)" if a.gaz else "tu m'as interdit de toucher aux gaz (--sans-gaz)")
@@ -1787,12 +1875,12 @@ def approche_pas(sim, a, app, vitesse):
             sim.envoyer("FLAPS_INCR")
 
     # Verifications
-    if not app["pose"] and app["etabli"] and avant <= 3 * NM:
+    if not (app["pose"] or (app["autoland"] and glide)) and app["etabli"] and avant <= 3 * NM:
         return "main"
     if app["etabli"] and avant > 2 * NM and agl < 400:
         app["raison"] = "trop pres du relief"
         return "remise"
-    if avant < NM and not app["stable"]:                  # sur le plan, on passe 500 ft vers 1,4 NM
+    if app["etabli"] and avant < NM and not app["stable"]:   # sur le plan, on passe 500 ft vers 1,4 NM
         app["raison"] = "pas stabilise a 1 NM du seuil"
         return "remise"
     if app["plan"] and agl <= 500:
@@ -1985,6 +2073,63 @@ def _arrondi(sim, a, app, vitesse, mesures):
             return "pose"
 
 
+def autoland(sim, a, app, vitesse=None):
+    """Avion de ligne sur ILS, de 150 ft a l'arret : l'autoland de l'avion fait l'arrondi. Le bot
+    reduit les gaz a 20 ft, sort les aerofreins et freine au toucher, coupe le pilote automatique
+    a 40 kt, tient l'axe au palonnier s'il en connait le sens, et s'arrete sur la piste.
+    Renvoie 'pose', ou 'a_toi' si le pilote automatique decroche avant le toucher."""
+    p = app["piste"]
+    t0 = sim.horloge()
+    t_sol, vs_air, vs_t, ecart_t, ralenti = None, 0.0, 0.0, 0.0, False
+    cap_prec, taux = None, 0.0
+    while True:
+        sim.attendre(0.1)
+        t = sim.horloge() - t0
+        agl = num(sim.lire_vite("PLANE_ALT_ABOVE_GROUND"), 999) - a.hauteur_sol
+        sol = booleen(sim.lire_vite("SIM_ON_GROUND")) is True
+        vs, gs = num(sim.lire_vite("VERTICAL_SPEED")), num(sim.lire_vite("GROUND_VELOCITY"), 99)
+        pos = position(sim, vite=True)
+        ecart = sur_piste(p, *pos)[1] if pos else 0.0
+        if t_sol is None:
+            if not sol:
+                vs_air = vs
+            if booleen(sim.lire_vite("AUTOPILOT_MASTER")) is False or t > 120:
+                dire("Le pilote automatique ne fait pas l'atterrissage (decroche en courte finale) : "
+                     "A TOI, pose-toi ou remets les gaz.", alerte=True)
+                return "a_toi"
+            if agl <= 20 and not ralenti:
+                ralenti = True
+                if booleen(sim.lire("AUTOPILOT_THROTTLE_ARM")) is True:
+                    sim.envoyer("AUTO_THROTTLE_ARM")      # automanette coupee : manettes au ralenti
+                sim.envoyer("THROTTLE_SET", 0)
+            if sol:
+                t_sol, vs_t, ecart_t = t, vs_air, ecart
+                sim.envoyer("THROTTLE_SET", 0)
+                sim.envoyer("SPOILERS_ON")
+            continue
+        if t - t_sol > 2 and gs > 3:
+            sim.envoyer("BRAKES")
+        if gs < 40:
+            if booleen(sim.lire_vite("AUTOPILOT_MASTER")) is True:
+                sim.envoyer("AUTOPILOT_OFF")              # l'autoland guide le roulage jusqu'ici
+            cap = num(sim.lire_vite("PLANE_HEADING_DEGREES_TRUE"), None)
+            if cap is not None and a.sens.get("pal"):
+                cap = math.degrees(cap) % 360
+                if cap_prec is not None:
+                    taux += (angle(cap - cap_prec) / 0.1 - taux) * 0.2
+                cap_prec = cap
+                ecart_cap = angle(p["cap"] - cap) - max(-5.0, min(5.0, ecart / 3))
+                sim.envoyer("RUDDER_SET", a.sens["pal"] * loi_palonnier(ecart_cap, taux, gs))
+        if gs < 3 or t - t_sol > 120:
+            sim.envoyer("RUDDER_SET", 0)
+            if booleen(frais(sim, "BRAKE_PARKING_POSITION")) is False:
+                sim.envoyer("PARKING_BRAKES")
+            sim.envoyer("SPOILERS_OFF")
+            sim.envoyer("FLAPS_UP")
+            app["bilan"] = (vs_t, ecart_t, -sur_piste(p, *pos)[0] if pos else None)
+            return "pose"
+
+
 # --------------------------------------------------------------------------
 # Vol
 # --------------------------------------------------------------------------
@@ -2047,7 +2192,8 @@ def _voler(sim, a, ordres):
     dire("Avion : " + ", ".join(
         [f"cabre a {avion['vr']} kt" if avion["vr"] else f"vitesse de cabre inconnue ({a.vr} kt par defaut)",
          f"montee a {avion['montee']:.0f} kt" if avion["montee"] else "vitesse de montee inconnue",
-         f"{avion['moteurs']} moteur(s)"]) + ".")
+         f"{avion['moteurs']} moteur(s)"] + (["avion de ligne (automanette, volets cran par cran, "
+                                               "autoland sur ILS)"] if avion["ligne"] else [])) + ".")
     suivi_min = lire_reglages().get("suivi")
     suivi_min = suivi_min if isinstance(suivi_min, int) else 0
     trouver_arrivee()
@@ -2057,7 +2203,7 @@ def _voler(sim, a, ordres):
                  or moteurs_en_marche(sim) is False)):
         preparer(sim)
     decollage_auto = volets_a_rentrer = False
-    train, volets, volets_go = Train(), Volets(), False
+    train, volets, volets_go = Train(), volets_pour(avion, avion["vr"] or a.vr), False
     vr = a.vr
     sens_mesure = bool(a.sens) or sens_retenus(sim, a)
     if sens_mesure and a.atterrissage:
@@ -2087,8 +2233,9 @@ def _voler(sim, a, ordres):
         # Apres un decollage automatique : si le controle donne (ou change) l'altitude, on la prend.
         if decollage_auto and prendre_croisiere_du_controle(sim, a):
             engager_vertical(sim, a.croisiere, a.vs_montee)
-        # Apres un decollage automatique : volets rentres des que la vitesse le permet.
-        if volets_a_rentrer and num(sim.lire("AIRSPEED_INDICATED")) >= vr + 25 \
+        # Apres un decollage automatique : volets rentres des que la vitesse le permet
+        # (avion de ligne : cran par cran, chaque cran attend sa vitesse).
+        if volets_a_rentrer and (avion["ligne"] or num(sim.lire("AIRSPEED_INDICATED")) >= vr + 25) \
                 and num(sim.lire("PLANE_ALT_ABOVE_GROUND")) >= 400:
             volets_a_rentrer, volets_go = False, True
         if volets_go:
@@ -2122,6 +2269,7 @@ def _voler(sim, a, ordres):
 
     phase = "MONTEE"
     vitesse = None                      # etat du correcteur de gaz, actif en descente
+    vit_ligne, t_vit = {}, 10           # avion de ligne : automanette et aerofreins ; 1er reglage tout de suite
     echecs, t_verif, t_log = 0, 0, 0
     t_controle, controle_prec = 0, None
     sans_distance_signale = False
@@ -2283,7 +2431,11 @@ def _voler(sim, a, ordres):
         t_baro += 1
         if t_baro >= 60 and not fige:
             t_baro = 0
-            sim.envoyer("BAROMETRIC")
+            # shortcut: altitude de transition fixe a 18000 ft (Etats-Unis) ; plus basse en Europe, a lire un jour.
+            if alt > 18500:
+                sim.envoyer("BAROMETRIC_STD_PRESSURE")      # niveaux de vol : 1013 hPa
+            elif alt < 17500:
+                sim.envoyer("BAROMETRIC")
         # Phares d'atterrissage : eteints au-dessus de 10000 ft, rallumes en dessous.
         voulu = alt < 10000
         if phares is not None and voulu != phares:
@@ -2317,6 +2469,18 @@ def _voler(sim, a, ordres):
             ias_avant = ias
             if a.vs_montee != ancien:
                 regler_vs(sim, a.vs_montee)
+        # Avion de ligne : vitesse visee (automanette ou gaz), limite de Mach et aerofreins, toutes les 10 s.
+        t_vit += 1
+        if avion["ligne"] and phase in ("MONTEE", "CROISIERE", "DESCENTE") and t_vit >= 10:
+            t_vit = 0
+            if vitesse is None and a.gaz and vit_ligne.get("at") is False:
+                vitesse = {"cible": ias, "prec": ias,
+                           "gaz": num(sim.lire("GENERAL_ENG_THROTTLE_LEVER_POSITION:1"), 70) / 100}
+            cible = vitesse_ligne(sim, a, avion, phase, alt, ias, vitesse, vit_ligne)
+            if phase == "MONTEE":
+                v_montee = cible              # le taux de montee automatique vise cette vitesse
+        if avion["ligne"] and vitesse and phase in ("MONTEE", "CROISIERE"):
+            tenir_vitesse(sim, vitesse, ias)
 
         # Securites
         if sim.lire("STALL_WARNING"):
@@ -2335,6 +2499,12 @@ def _voler(sim, a, ordres):
             if app:
                 phase, t_verif = "APPROCHE", 0
                 mode_cap(sim, round(math.degrees(num(sim.lire("PLANE_HEADING_DEGREES_MAGNETIC")))) % 360)
+                if avion["ligne"]:
+                    if vit_ligne.get("af"):
+                        sim.envoyer("SPOILERS_OFF")
+                        vit_ligne["af"] = False
+                    sim.envoyer("SPOILERS_ARM_ON")          # aerofreins sortis seuls au toucher
+                    sim.envoyer("SET_AUTOBRAKE_CONTROL", 2)  # freinage automatique moyen
             else:
                 a.atterrissage = False
                 dire(f"Pas d'atterrissage automatique : {raison}. Je te rendrai l'avion a {a.remise:.0f} NM.",
@@ -2460,7 +2630,8 @@ def _voler(sim, a, ordres):
             if vitesse:
                 tenir_vitesse(sim, vitesse, ias)
             if action == "arrondi":
-                action = arrondir_et_rouler(sim, a, app, vitesse)    # remise de gaz deja faite s'il le faut
+                # Remise de gaz deja faite s'il le faut ; avion de ligne : autoland de l'avion.
+                action = (autoland if app["autoland"] else arrondir_et_rouler)(sim, a, app, vitesse)
                 if action == "pose":
                     vs_t, ecart_t, arret = app["bilan"]
                     dire(f"Pose sur la piste {app['piste']['ident']} a {vs_t:.0f} ft/min, {ecart_t:+.0f} m de l'axe"
@@ -2478,7 +2649,7 @@ def _voler(sim, a, ordres):
                          f"{ias_t:.0f} kt, arrondi de {duree:.0f} s ({avis}). Mesures dans le dernier fichier "
                          f"atterrissage_*.csv. Je remonte a {a.croisiere} ft et je reprends le vol.", tel=True)
                 # Reprise du vol : train et volets rentres, route et croisiere reprises, gaz rendus en croisiere.
-                train, volets, vitesse, app = Train(), Volets(), None, None
+                train, volets, vitesse, app = Train(), volets_pour(avion, avion["vr"] or a.vr), None, None
                 if lateral == "FIXE" and cap_repetition is not None:
                     mode_cap(sim, cap_repetition)
                 else:
@@ -2486,6 +2657,8 @@ def _voler(sim, a, ordres):
                 phase, t_verif, echecs = "MONTEE", 0, 0
             elif action == "remise":
                 phase, vitesse = "REMISE", None
+            elif action == "a_toi":                       # autoland decroche : alerte deja envoyee, pas de pause
+                phase, t_verif, vitesse = "REMISE", 0, None
             elif action == "main":
                 en_pause = a.pause and (sim.envoyer("PAUSE_ON") or sim.envoyer("PAUSE_SET", 1))
                 dire(f"Approche de la piste {app['piste']['ident']} : 3 NM du seuil, {alt:.0f} ft, {ias:.0f} kt, "

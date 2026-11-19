@@ -7,6 +7,9 @@ Telegram. Il tourne sur le PC du simulateur et parle au simulateur par SimConnec
   décoller seul une fois aligné sur la piste.
 - **En vol** : montée, croisière (celle donnée par le contrôle aérien, sinon celle du dernier vol),
   descente vers l'aéroport d'arrivée lu dans le plan de vol, alertes carburant et relief.
+- **Avions de ligne** (multimoteurs qui décrochent au-dessus de 90 kt) : automanette, 250 kt sous
+  10 000 ft, Mach 0,78 au plus, volets rentrés cran par cran, aérofreins en descente, atterrissage
+  par l'autoland de l'avion sur ILS (sinon l'avion t'est rendu à 3 NM).
 - **À l'arrivée** : pause à 10 NM pour te rendre la main, ou, avec `atterrissage oui`, approche,
   atterrissage et arrêt sur la piste. `repetition` répète l'approche et l'arrondi sur une piste
   imaginaire en plein ciel, pour régler l'arrondi sans risquer l'avion.
